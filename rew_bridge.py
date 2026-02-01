@@ -1,0 +1,435 @@
+#!/usr/bin/env python3
+"""
+REW SPL Meter Bridge
+
+Launches REW headlessly, reads SPL values from REW's API,
+exposes them via HTTP for Bitfocus Companion, and accepts control commands.
+"""
+
+import asyncio
+import logging
+import math
+import os
+import platform
+import subprocess
+import time
+from collections import deque
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
+from typing import Optional
+
+import httpx
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+
+# Configuration
+REW_API_PORT = 4735
+BRIDGE_PORT = 8080
+REW_API_BASE = f"http://localhost:{REW_API_PORT}"
+SUBSCRIPTION_CALLBACK_URL = f"http://localhost:{BRIDGE_PORT}/rew-callback"
+
+# 2-minute Leq buffer: 2 minutes * 60 seconds * 10 Hz = 1200 samples
+LEQ_2MIN_BUFFER_SIZE = 1200
+LEQ_2MIN_MIN_SAMPLES = 1200  # Require full 2 minutes for valid calculation
+
+# Logging setup
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class SPLState:
+    """Current SPL meter state."""
+    spl_a_slow: Optional[float] = None
+    leq_15min: Optional[float] = None
+    leq_1min: Optional[float] = None
+    leq_10min: Optional[float] = None
+    elapsed_time: float = 0.0
+    last_update: float = 0.0
+    spl_buffer: deque = field(default_factory=lambda: deque(maxlen=LEQ_2MIN_BUFFER_SIZE))
+    rew_running: bool = False
+    measurement_active: bool = False
+
+    def compute_leq_2min(self) -> Optional[float]:
+        """Compute 2-minute Leq from buffered SPL values."""
+        if len(self.spl_buffer) < LEQ_2MIN_MIN_SAMPLES:
+            return None
+
+        # Leq = 10 * log10(mean(10^(spl_i/10)))
+        try:
+            linear_values = [10 ** (spl / 10) for spl in self.spl_buffer]
+            mean_linear = sum(linear_values) / len(linear_values)
+            return 10 * math.log10(mean_linear)
+        except (ValueError, ZeroDivisionError):
+            return None
+
+
+# Global state
+state = SPLState()
+rew_process: Optional[subprocess.Popen] = None
+http_client: Optional[httpx.AsyncClient] = None
+
+
+class ControlRequest(BaseModel):
+    """Control command request."""
+    action: str  # start, stop, restart, shutdown
+
+
+class SPLValues(BaseModel):
+    """SPL values received from REW subscription."""
+    meterNumber: int = 1
+    weighting: str = "A"
+    filter: str = "Slow"
+    spl: float = 0.0
+    leq: float = 0.0
+    isRollingLeq: bool = False
+    rollingLeqMinutes: int = 0
+    leq1m: float = 0.0
+    leq10m: float = 0.0
+    sel: float = 0.0
+    elapsedTime: float = 0.0
+
+
+def find_rew_executable() -> Optional[str]:
+    """Find the REW executable based on platform."""
+    system = platform.system()
+
+    if system == "Windows":
+        paths = [
+            r"C:\Program Files\REW\roomeqwizard.exe",
+            r"C:\Program Files (x86)\REW\roomeqwizard.exe",
+        ]
+        for path in paths:
+            if os.path.exists(path):
+                return path
+        return None
+
+    elif system == "Darwin":  # macOS
+        # Check if REW.app exists in Applications
+        if os.path.exists("/Applications/REW.app"):
+            return "/Applications/REW.app"
+        return None
+
+    return None
+
+
+def launch_rew() -> Optional[subprocess.Popen]:
+    """Launch REW with API enabled and no GUI."""
+    global rew_process
+
+    system = platform.system()
+
+    try:
+        if system == "Windows":
+            rew_path = find_rew_executable()
+            if not rew_path:
+                logger.error("REW executable not found on Windows")
+                return None
+
+            logger.info(f"Launching REW from: {rew_path}")
+            rew_process = subprocess.Popen(
+                [rew_path, "-api", "-nogui"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
+            )
+
+        elif system == "Darwin":  # macOS
+            if not os.path.exists("/Applications/REW.app"):
+                logger.error("REW.app not found in /Applications")
+                return None
+
+            logger.info("Launching REW on macOS")
+            rew_process = subprocess.Popen(
+                ["open", "-a", "REW.app", "--args", "-api", "-nogui"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
+            )
+
+        else:
+            logger.error(f"Unsupported platform: {system}")
+            return None
+
+        state.rew_running = True
+        return rew_process
+
+    except Exception as e:
+        logger.error(f"Failed to launch REW: {e}")
+        return None
+
+
+async def wait_for_rew_api(timeout: float = 30.0) -> bool:
+    """Wait for REW API to become available."""
+    start_time = time.time()
+
+    while time.time() - start_time < timeout:
+        try:
+            response = await http_client.get(f"{REW_API_BASE}/application")
+            if response.status_code == 200:
+                logger.info("REW API is ready")
+                return True
+        except httpx.RequestError:
+            pass
+
+        await asyncio.sleep(0.5)
+
+    logger.error(f"REW API did not become available within {timeout} seconds")
+    return False
+
+
+async def configure_spl_meter():
+    """Configure the SPL meter for our needs."""
+    config = {
+        "mode": "SPL",
+        "weighting": "A",
+        "filter": "Slow",
+        "rollingLeqActive": True,
+        "rollingLeqMinutes": 15
+    }
+
+    try:
+        response = await http_client.post(
+            f"{REW_API_BASE}/spl-meter/1/configuration",
+            json=config
+        )
+        if response.status_code == 200:
+            logger.info("SPL meter configured successfully")
+            return True
+        else:
+            logger.error(f"Failed to configure SPL meter: {response.status_code}")
+            return False
+    except httpx.RequestError as e:
+        logger.error(f"Error configuring SPL meter: {e}")
+        return False
+
+
+async def subscribe_to_spl_meter():
+    """Subscribe to SPL meter updates."""
+    try:
+        response = await http_client.post(
+            f"{REW_API_BASE}/spl-meter/1/subscribe",
+            json={"callbackUrl": SUBSCRIPTION_CALLBACK_URL}
+        )
+        if response.status_code == 200:
+            logger.info(f"Subscribed to SPL meter updates (callback: {SUBSCRIPTION_CALLBACK_URL})")
+            return True
+        else:
+            logger.error(f"Failed to subscribe to SPL meter: {response.status_code}")
+            return False
+    except httpx.RequestError as e:
+        logger.error(f"Error subscribing to SPL meter: {e}")
+        return False
+
+
+async def send_spl_command(command: str) -> bool:
+    """Send a command to the SPL meter."""
+    try:
+        response = await http_client.post(
+            f"{REW_API_BASE}/spl-meter/1/command",
+            json={"command": command}
+        )
+        if response.status_code == 200:
+            logger.info(f"SPL meter command '{command}' sent successfully")
+            return True
+        else:
+            logger.error(f"Failed to send SPL meter command: {response.status_code}")
+            return False
+    except httpx.RequestError as e:
+        logger.error(f"Error sending SPL meter command: {e}")
+        return False
+
+
+async def shutdown_rew():
+    """Shutdown REW gracefully."""
+    global rew_process
+
+    try:
+        response = await http_client.post(
+            f"{REW_API_BASE}/application/command",
+            json={"command": "shutdown"}
+        )
+        logger.info("REW shutdown command sent")
+    except httpx.RequestError:
+        pass  # REW may already be shutting down
+
+    if rew_process:
+        try:
+            rew_process.terminate()
+            rew_process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            rew_process.kill()
+        rew_process = None
+
+    state.rew_running = False
+
+
+async def restart_rew():
+    """Restart REW."""
+    logger.info("Restarting REW...")
+    await shutdown_rew()
+    await asyncio.sleep(2)  # Give time for cleanup
+
+    if launch_rew():
+        if await wait_for_rew_api():
+            await configure_spl_meter()
+            await subscribe_to_spl_meter()
+            logger.info("REW restarted successfully")
+            return True
+
+    logger.error("Failed to restart REW")
+    return False
+
+
+async def subscription_keepalive():
+    """Periodically re-subscribe to handle dropped subscriptions."""
+    while True:
+        await asyncio.sleep(60)  # Check every minute
+        if state.rew_running:
+            try:
+                # Test if REW is still responding
+                response = await http_client.get(
+                    f"{REW_API_BASE}/application",
+                    timeout=5.0
+                )
+                if response.status_code != 200:
+                    logger.warning("REW API not responding, attempting to resubscribe")
+                    await subscribe_to_spl_meter()
+            except httpx.RequestError:
+                logger.warning("Lost connection to REW API")
+                state.rew_running = False
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Application lifespan manager."""
+    global http_client
+
+    # Startup
+    http_client = httpx.AsyncClient(timeout=10.0)
+
+    logger.info("Starting REW SPL Meter Bridge")
+
+    # Launch REW
+    if launch_rew():
+        if await wait_for_rew_api():
+            await configure_spl_meter()
+            await subscribe_to_spl_meter()
+
+    # Start keepalive task
+    keepalive_task = asyncio.create_task(subscription_keepalive())
+
+    yield
+
+    # Shutdown
+    keepalive_task.cancel()
+    try:
+        await keepalive_task
+    except asyncio.CancelledError:
+        pass
+
+    await shutdown_rew()
+    await http_client.aclose()
+    logger.info("REW SPL Meter Bridge stopped")
+
+
+# FastAPI app
+app = FastAPI(
+    title="REW SPL Meter Bridge",
+    description="Bridge between REW SPL meter and Bitfocus Companion",
+    version="1.0.0",
+    lifespan=lifespan
+)
+
+
+@app.get("/api/spl")
+async def get_spl():
+    """Get current SPL values."""
+    leq_2min = state.compute_leq_2min()
+
+    return {
+        "spl_a_slow": state.spl_a_slow,
+        "leq_2min": round(leq_2min, 1) if leq_2min else None,
+        "leq_15min": state.leq_15min,
+        "elapsed_time": state.elapsed_time,
+        "valid_2min": leq_2min is not None,
+        "rew_running": state.rew_running,
+        "measurement_active": state.measurement_active,
+        "buffer_samples": len(state.spl_buffer),
+        "buffer_seconds": len(state.spl_buffer) / 10.0  # Assuming 10 Hz
+    }
+
+
+@app.post("/api/control")
+async def control(request: ControlRequest):
+    """Handle control commands."""
+    action = request.action.lower()
+
+    if action == "start":
+        if not state.rew_running:
+            raise HTTPException(status_code=503, detail="REW is not running")
+
+        # Clear buffer when starting new measurement
+        state.spl_buffer.clear()
+        success = await send_spl_command("Start")
+        if success:
+            state.measurement_active = True
+        return {"status": "ok" if success else "error", "action": action}
+
+    elif action == "stop":
+        if not state.rew_running:
+            raise HTTPException(status_code=503, detail="REW is not running")
+
+        success = await send_spl_command("Stop")
+        if success:
+            state.measurement_active = False
+        return {"status": "ok" if success else "error", "action": action}
+
+    elif action == "restart":
+        success = await restart_rew()
+        state.spl_buffer.clear()
+        state.measurement_active = False
+        return {"status": "ok" if success else "error", "action": action}
+
+    elif action == "shutdown":
+        await shutdown_rew()
+        state.measurement_active = False
+        return {"status": "ok", "action": action}
+
+    else:
+        raise HTTPException(status_code=400, detail=f"Unknown action: {action}")
+
+
+@app.post("/rew-callback")
+async def rew_callback(values: SPLValues):
+    """Receive SPL updates from REW subscription."""
+    state.spl_a_slow = values.spl
+    state.leq_15min = values.leq if values.isRollingLeq and values.rollingLeqMinutes == 15 else state.leq_15min
+    state.leq_1min = values.leq1m
+    state.leq_10min = values.leq10m
+    state.elapsed_time = values.elapsedTime
+    state.last_update = time.time()
+    state.measurement_active = True
+
+    # Add to buffer for 2-min Leq calculation
+    state.spl_buffer.append(values.spl)
+
+    return {"status": "ok"}
+
+
+@app.get("/health")
+async def health():
+    """Health check endpoint."""
+    return {
+        "status": "healthy",
+        "rew_running": state.rew_running,
+        "last_update": state.last_update,
+        "seconds_since_update": time.time() - state.last_update if state.last_update > 0 else None
+    }
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=BRIDGE_PORT, log_level="info")
