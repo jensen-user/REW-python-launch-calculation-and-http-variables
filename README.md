@@ -124,8 +124,9 @@ Health check endpoint:
 
 ### Windows
 
-1. Press `Win+R`, type `shell:startup`, press Enter
-2. Copy `start_rew_bridge.bat` to that folder
+1. **First time only**: Right-click `start_rew_bridge.bat` → "Run as administrator" (this creates the firewall rule)
+2. Press `Win+R`, type `shell:startup`, press Enter
+3. Copy `start_rew_bridge.bat` to that folder
 
 ## Bitfocus Companion Integration
 
@@ -138,7 +139,10 @@ Example variable parsing:
 
 ## Firewall Notes
 
-- **Windows**: Allow inbound connections on port 8080 for remote Companion access
+- **Windows**: The startup script automatically adds a firewall rule when run as Administrator the first time. If you need to add it manually:
+  ```
+  netsh advfirewall firewall add rule name="REW SPL Bridge" dir=in action=allow protocol=tcp localport=8080
+  ```
 - **macOS**: Allow incoming connections when prompted
 
 ## License
