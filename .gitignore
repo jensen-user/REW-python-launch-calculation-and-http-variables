@@ -39,3 +39,10 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Runtime config (config.example.json is the reference)
+config.json
+
+# Build artifacts
+installer_output/
+*.spec.bak

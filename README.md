@@ -1,6 +1,6 @@
 # REW SPL Meter Bridge
 
-A Python bridge that launches REW (Room EQ Wizard) headlessly, reads SPL values from REW's API, and exposes them via HTTP for Bitfocus Companion integration.
+A bridge that launches REW (Room EQ Wizard) headlessly, reads SPL values from REW's API, and exposes them via HTTP for Bitfocus Companion integration. On Windows, it runs as a system tray application with an installer.
 
 ## Architecture
 
@@ -11,13 +11,59 @@ A Python bridge that launches REW (Room EQ Wizard) headlessly, reads SPL values 
 └─────────────────┘         └─────────────────┘         └─────────────────┘
 ```
 
+## Windows Installation
+
+1. Download `REW-Bridge-Setup-X.Y.Z.exe` from [GitHub Releases](../../releases)
+2. Run the installer — it will:
+   - Install the app to Program Files
+   - Create a desktop shortcut and Start Menu entry
+   - Optionally add a Windows Firewall rule
+   - Optionally set it to start automatically on boot
+3. Launch from the desktop shortcut — a system tray icon appears near the clock
+
+**Prerequisite:** [REW (Room EQ Wizard)](https://www.roomeqwizard.com/) must be installed separately.
+
+### System Tray Icon
+
+- **Red circle** — REW is not connected
+- **Green circle** — REW is connected and running
+- **Right-click menu:**
+  - Status and port display
+  - Change Port — opens a dialog to set a new port (restart required)
+  - Open Log / Open Log Folder — access log files for troubleshooting
+  - Quit — cleanly shuts down REW and the bridge
+
+### Configuration
+
+The app stores its settings in `config.json` in the install directory:
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `rew_path` | `null` | Path to REW executable. `null` = auto-detect from Program Files |
+| `bridge_port` | `8080` | HTTP port for the bridge server |
+| `rew_api_port` | `4735` | REW API port |
+| `log_level` | `"INFO"` | Logging level (`DEBUG`, `INFO`, `WARNING`, `ERROR`) |
+
+On first run, the app auto-selects a free port starting at 8080 and saves it to `config.json`.
+
+### Troubleshooting
+
+| Problem | Solution |
+|---------|----------|
+| Bridge won't start | Check `rew_bridge.log` for errors (right-click tray → Open Log) |
+| Companion can't connect | Verify the firewall rule exists, check the port in the tray menu |
+| REW not found | Set `rew_path` in `config.json` to the full path of `roomeqwizard.exe` |
+| SPL values are null | Ensure REW measurement is started (POST `/api/control` with `{"action":"start"}`) |
+| Tray icon stays red | REW may still be starting — wait 30 seconds. Check log for API errors |
+
 ## Features
 
-- Launches REW automatically with API mode enabled
+- Launches REW automatically with API mode enabled (`-api -nogui`)
 - Subscribes to real-time SPL meter updates
 - Computes 2-minute rolling Leq (not natively available in REW)
 - Exposes values via simple HTTP API for Bitfocus Companion
 - Control commands: start, stop, restart, shutdown
+- File logging with rotation (1 MB, 3 backups)
 
 ## Available Values
 
@@ -27,37 +73,9 @@ A Python bridge that launches REW (Room EQ Wizard) headlessly, reads SPL values 
 | 2-min Leq | Computed from buffered SPL readings |
 | 15-min Leq | Direct from REW API (rolling Leq) |
 
-## Requirements
+## API Endpoints
 
-- Python 3.8+
-- REW (Room EQ Wizard) installed
-  - **macOS**: REW.app in `/Applications`
-  - **Windows**: REW in `C:\Program Files\REW`
-
-## Installation
-
-```bash
-pip install -r requirements.txt
-```
-
-## Usage
-
-### Start the Bridge
-
-```bash
-python rew_bridge.py
-```
-
-The bridge will:
-1. Launch REW with `-api -nogui` flags
-2. Wait for REW's API to become available
-3. Configure the SPL meter (A-weighting, Slow filter, 15-min rolling Leq)
-4. Subscribe to SPL meter updates
-5. Start the HTTP server on port 8080
-
-### API Endpoints
-
-#### GET /api/spl
+### GET /api/spl
 
 Returns current SPL values:
 
@@ -75,7 +93,7 @@ Returns current SPL values:
 }
 ```
 
-#### POST /api/control
+### POST /api/control
 
 Control the SPL meter:
 
@@ -101,7 +119,7 @@ curl -X POST http://localhost:8080/api/control \
   -d '{"action":"shutdown"}'
 ```
 
-#### GET /health
+### GET /health
 
 Health check endpoint:
 
@@ -114,36 +132,59 @@ Health check endpoint:
 }
 ```
 
-## Autostart on Boot
-
-### macOS
-
-1. Make the script executable: `chmod +x start_rew_bridge.command`
-2. Go to System Settings → General → Login Items
-3. Add `start_rew_bridge.command`
-
-### Windows
-
-1. **First time only**: Right-click `start_rew_bridge.bat` → "Run as administrator" (this creates the firewall rule)
-2. Press `Win+R`, type `shell:startup`, press Enter
-3. Copy `start_rew_bridge.bat` to that folder
-
 ## Bitfocus Companion Integration
 
 Use the Generic HTTP module in Companion to poll `/api/spl` and display values.
 
 Example variable parsing:
-- `$.spl_a_slow` - Current SPL
-- `$.leq_2min` - 2-minute Leq
-- `$.leq_15min` - 15-minute Leq
+- `$.spl_a_slow` — Current SPL
+- `$.leq_2min` — 2-minute Leq
+- `$.leq_15min` — 15-minute Leq
 
-## Firewall Notes
+## macOS
 
-- **Windows**: The startup script automatically adds a firewall rule when run as Administrator the first time. If you need to add it manually:
-  ```
-  netsh advfirewall firewall add rule name="REW SPL Bridge" dir=in action=allow protocol=tcp localport=8080
-  ```
-- **macOS**: Allow incoming connections when prompted
+On macOS, run the bridge from source (see Development section below). The tray app and installer are Windows-only. Allow incoming connections when prompted by the firewall.
+
+## Development
+
+### Run from source
+
+```bash
+pip install -r requirements.txt
+
+# Bridge only (headless)
+python rew_bridge.py
+
+# System tray app (Windows)
+python tray_app.py
+```
+
+### Build locally
+
+```bash
+# Install build deps
+pip install -r requirements-dev.txt
+
+# Generate icon
+python generate_icon.py
+
+# Build with PyInstaller (one-folder mode)
+pyinstaller --clean rew_bridge.spec
+
+# Build installer (requires Inno Setup on Windows)
+iscc /DMyAppVersion=0.1.0 installer.iss
+```
+
+### Releases
+
+Releases are built automatically by GitHub Actions when a version tag is pushed:
+
+```bash
+git tag v1.0.0
+git push origin v1.0.0
+```
+
+This triggers the CI pipeline which builds the PyInstaller bundle, creates the Inno Setup installer, and publishes it as a GitHub Release.
 
 ## License
 

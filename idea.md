@@ -1,3 +1,7 @@
+**Note:** This is the original brainstorm document. The actual implementation has diverged in several ways: REW API port is 4735 (not 4823), the bridge uses FastAPI (not Flask), SPL data comes via subscriptions (not polling), and pandas is not used. See README.md for current documentation.
+
+---
+
 Room EQ Wizard (REW) offers an SPL meter with API access limited to localhost, providing real-time SPL A-weighted readings like "slow" (1s time constant), 1-minute Leq, and 10-minute Leq, but lacks direct support for 2-minute or 15-minute averages. Your setup bridges this by running REW headless (no GUI) on one computer via a Python script that launches it, polls these API values twice per second, computes custom averages (e.g., rolling SPL A 2min and 15min from logged data or API Leq), and exposes them as HTTP endpoints for Bitfocus Companion on another computer. The script also accepts HTTP commands from Companion to start/stop measurements, restart REW, or shut it down entirely.
 ​
 

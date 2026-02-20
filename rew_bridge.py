@@ -7,15 +7,19 @@ exposes them via HTTP for Bitfocus Companion, and accepts control commands.
 """
 
 import asyncio
+import json
 import logging
 import math
 import os
+import pathlib
 import platform
+import socket
 import subprocess
 import time
 from collections import deque
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from logging.handlers import RotatingFileHandler
 from typing import Optional
 
 import httpx
@@ -23,22 +27,108 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-# Configuration
-REW_API_PORT = 4735
-BRIDGE_PORT = 8080
+# App directory and log file paths (used by tray_app.py)
+APP_DIR = pathlib.Path(__file__).parent
+LOG_FILE = APP_DIR / "rew_bridge.log"
+
+# Default configuration
+DEFAULTS = {
+    "rew_path": None,
+    "bridge_port": 8080,
+    "rew_api_port": 4735,
+    "log_level": "INFO",
+}
+
+
+def load_config() -> dict:
+    """Load configuration from config.json, falling back to defaults."""
+    config = dict(DEFAULTS)
+    config_path = APP_DIR / "config.json"
+
+    if config_path.exists():
+        try:
+            with open(config_path, "r") as f:
+                user_config = json.load(f)
+            for key in DEFAULTS:
+                if key in user_config:
+                    config[key] = user_config[key]
+        except (json.JSONDecodeError, OSError) as e:
+            # Will be logged once logging is set up; use defaults
+            pass
+
+    return config
+
+
+def save_config(config: dict):
+    """Save configuration to config.json."""
+    config_path = APP_DIR / "config.json"
+    with open(config_path, "w") as f:
+        json.dump(config, f, indent=4)
+
+
+def find_free_port(start: int = 8080) -> int:
+    """Scan for a free port starting from the given port number."""
+    for port in range(start, start + 100):
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.bind(("0.0.0.0", port))
+                return port
+        except OSError:
+            continue
+    return start  # Fallback to start port
+
+
+def setup_logging(log_level: str = "INFO"):
+    """Configure logging with RotatingFileHandler and console output."""
+    level = getattr(logging, log_level.upper(), logging.INFO)
+
+    root_logger = logging.getLogger()
+    root_logger.setLevel(level)
+
+    # Clear existing handlers
+    root_logger.handlers.clear()
+
+    formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+
+    # File handler: 1 MB max, 3 backups
+    file_handler = RotatingFileHandler(
+        LOG_FILE, maxBytes=1_000_000, backupCount=3, encoding="utf-8"
+    )
+    file_handler.setLevel(level)
+    file_handler.setFormatter(formatter)
+    root_logger.addHandler(file_handler)
+
+    # Console handler
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(level)
+    console_handler.setFormatter(formatter)
+    root_logger.addHandler(console_handler)
+
+
+# Load config and set up logging
+config = load_config()
+
+# On first run (no config.json), find a free port and save config
+config_path = APP_DIR / "config.json"
+if not config_path.exists():
+    config["bridge_port"] = find_free_port(config["bridge_port"])
+    save_config(config)
+
+setup_logging(config["log_level"])
+logger = logging.getLogger(__name__)
+
+logger.info("Configuration: bridge_port=%s, rew_api_port=%s, log_level=%s, rew_path=%s",
+            config["bridge_port"], config["rew_api_port"], config["log_level"], config["rew_path"])
+
+# Derived configuration
+REW_API_PORT = config["rew_api_port"]
+BRIDGE_PORT = config["bridge_port"]
 REW_API_BASE = f"http://localhost:{REW_API_PORT}"
 SUBSCRIPTION_CALLBACK_URL = f"http://localhost:{BRIDGE_PORT}/rew-callback"
 
 # 2-minute Leq buffer: 2 minutes * 60 seconds * 10 Hz = 1200 samples
 LEQ_2MIN_BUFFER_SIZE = 1200
 LEQ_2MIN_MIN_SAMPLES = 1200  # Require full 2 minutes for valid calculation
-
-# Logging setup
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s"
-)
-logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -96,6 +186,13 @@ class SPLValues(BaseModel):
 
 def find_rew_executable() -> Optional[str]:
     """Find the REW executable based on platform."""
+    # Check config for custom path first
+    if config.get("rew_path"):
+        custom_path = config["rew_path"]
+        if os.path.exists(custom_path):
+            return custom_path
+        logger.warning("Configured rew_path does not exist: %s", custom_path)
+
     system = platform.system()
 
     if system == "Windows":
@@ -109,7 +206,6 @@ def find_rew_executable() -> Optional[str]:
         return None
 
     elif system == "Darwin":  # macOS
-        # Check if REW.app exists in Applications
         if os.path.exists("/Applications/REW.app"):
             return "/Applications/REW.app"
         return None
@@ -138,7 +234,8 @@ def launch_rew() -> Optional[subprocess.Popen]:
             )
 
         elif system == "Darwin":  # macOS
-            if not os.path.exists("/Applications/REW.app"):
+            rew_path = find_rew_executable()
+            if not rew_path:
                 logger.error("REW.app not found in /Applications")
                 return None
 
@@ -182,7 +279,7 @@ async def wait_for_rew_api(timeout: float = 30.0) -> bool:
 
 async def configure_spl_meter():
     """Configure the SPL meter for our needs."""
-    config = {
+    meter_config = {
         "mode": "SPL",
         "weighting": "A",
         "filter": "Slow",
@@ -193,7 +290,7 @@ async def configure_spl_meter():
     try:
         response = await http_client.post(
             f"{REW_API_BASE}/spl-meter/1/configuration",
-            json=config
+            json=meter_config
         )
         if response.status_code == 200:
             logger.info("SPL meter configured successfully")
