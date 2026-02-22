@@ -77,13 +77,15 @@ end;
 procedure SetRewGui;
 var
   ConfigPath: String;
-  Content: AnsiString;
+  RawContent: AnsiString;
+  Content: String;
 begin
   ConfigPath := ExpandConstant('{app}\config.json');
   if FileExists(ConfigPath) then
   begin
-    if LoadStringFromFile(ConfigPath, Content) then
+    if LoadStringFromFile(ConfigPath, RawContent) then
     begin
+      Content := RawContent;
       StringChangeEx(Content, '"rew_gui": false', '"rew_gui": true', True);
       SaveStringToFile(ConfigPath, Content, False);
     end;
