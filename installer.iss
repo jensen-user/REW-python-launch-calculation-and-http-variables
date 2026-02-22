@@ -33,6 +33,7 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: checkedonce
 Name: "autostart"; Description: "Start automatically when Windows starts"; GroupDescription: "Startup:"
 Name: "firewall"; Description: "Add Windows Firewall rule (recommended)"; GroupDescription: "Network:"; Flags: checkedonce
+Name: "rewgui"; Description: "Show REW GUI when running (default: headless)"; GroupDescription: "REW:"
 
 [Files]
 Source: "dist\REW SPL Bridge\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
@@ -73,6 +74,22 @@ begin
        '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
 end;
 
+procedure SetRewGui;
+var
+  ConfigPath: String;
+  Content: AnsiString;
+begin
+  ConfigPath := ExpandConstant('{app}\config.json');
+  if FileExists(ConfigPath) then
+  begin
+    if LoadStringFromFile(ConfigPath, Content) then
+    begin
+      StringChangeEx(Content, '"rew_gui": false', '"rew_gui": true', True);
+      SaveStringToFile(ConfigPath, Content, False);
+    end;
+  end;
+end;
+
 procedure CreateDefaultConfig;
 var
   ConfigPath: String;
@@ -85,7 +102,8 @@ begin
       '    "rew_path": null,' + #13#10 +
       '    "bridge_port": 8080,' + #13#10 +
       '    "rew_api_port": 4735,' + #13#10 +
-      '    "log_level": "INFO"' + #13#10 +
+      '    "log_level": "INFO",' + #13#10 +
+      '    "rew_gui": false' + #13#10 +
       '}' + #13#10,
       False);
   end;
@@ -96,6 +114,8 @@ begin
   if CurStep = ssPostInstall then
   begin
     CreateDefaultConfig;
+    if IsTaskSelected('rewgui') then
+      SetRewGui;
     if IsTaskSelected('firewall') then
       AddFirewallRule;
   end;

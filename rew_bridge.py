@@ -37,6 +37,7 @@ DEFAULTS = {
     "bridge_port": 8080,
     "rew_api_port": 4735,
     "log_level": "INFO",
+    "rew_gui": False,
 }
 
 
@@ -227,8 +228,11 @@ def launch_rew() -> Optional[subprocess.Popen]:
                 return None
 
             logger.info(f"Launching REW from: {rew_path}")
+            args = [rew_path, "-api"]
+            if not config.get("rew_gui"):
+                args.append("-nogui")
             rew_process = subprocess.Popen(
-                [rew_path, "-api", "-nogui"],
+                args,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL
             )
@@ -240,8 +244,11 @@ def launch_rew() -> Optional[subprocess.Popen]:
                 return None
 
             logger.info("Launching REW on macOS")
+            args = ["open", "-a", "REW.app", "--args", "-api"]
+            if not config.get("rew_gui"):
+                args.append("-nogui")
             rew_process = subprocess.Popen(
-                ["open", "-a", "REW.app", "--args", "-api", "-nogui"],
+                args,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL
             )

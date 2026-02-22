@@ -69,6 +69,11 @@ class REWBridgeTray:
                 None,
                 enabled=False,
             ),
+            pystray.MenuItem(
+                "Show REW GUI",
+                self.toggle_rew_gui,
+                checked=lambda item: self.config.get("rew_gui", False),
+            ),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Change Port...", self.change_port),
             pystray.Menu.SEPARATOR,
@@ -117,6 +122,29 @@ class REWBridgeTray:
                     self.icon.update_menu()
 
             self._stop_event.wait(5)
+
+    def toggle_rew_gui(self, icon=None, item=None):
+        """Toggle the Show REW GUI setting."""
+        thread = threading.Thread(target=self._toggle_rew_gui_action, daemon=True)
+        thread.start()
+
+    def _toggle_rew_gui_action(self):
+        """Flip rew_gui and persist to disk (runs in its own thread for tkinter safety)."""
+        import tkinter as tk
+        from tkinter import messagebox
+
+        new_value = not self.config.get("rew_gui", False)
+        self.config["rew_gui"] = new_value
+        rew_bridge.config["rew_gui"] = new_value
+        rew_bridge.save_config(self.config)
+
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showinfo(
+            "REW GUI Setting Changed",
+            "REW GUI setting changed. Takes effect next time REW is launched.",
+        )
+        root.destroy()
 
     def change_port(self, icon=None, item=None):
         """Show a dialog to change the bridge port."""

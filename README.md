@@ -43,6 +43,7 @@ The app stores its settings in `config.json` in the install directory:
 | `bridge_port` | `8080` | HTTP port for the bridge server |
 | `rew_api_port` | `4735` | REW API port |
 | `log_level` | `"INFO"` | Logging level (`DEBUG`, `INFO`, `WARNING`, `ERROR`) |
+| `rew_gui` | `false` | Show REW GUI when running. `false` = headless (`-nogui`) |
 
 On first run, the app auto-selects a free port starting at 8080 and saves it to `config.json`.
 
